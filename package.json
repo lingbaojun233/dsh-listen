@@ -1,0 +1,46 @@
+{
+  "name": "dsh-listen",
+  "version": "1.0.0",
+  "description": "Native DSH tools for a listen service: transcribe speech to text, or hear speech plus non-speech sound events (bangs, music, silence, loudness).",
+  "type": "module",
+  "license": "MIT",
+  "author": "lingbaojun233",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lingbaojun233/dsh-listen.git"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "asr",
+    "speech-to-text",
+    "transcription",
+    "audio",
+    "sound-events"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "homepage": "https://github.com/lingbaojun233/dsh-listen#readme",
+  "bugs": {
+    "url": "https://github.com/lingbaojun233/dsh-listen/issues"
+  }
+}

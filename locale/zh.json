@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "听力工具",
+    "description": "把 transcribe 与 hear 注册成 DSH 原生工具：转写成文字，或连非语音声音（响动、音乐、静音、整体吵不吵）一起听出来，后端是本地或远程的 listen 服务。"
+  }
+}

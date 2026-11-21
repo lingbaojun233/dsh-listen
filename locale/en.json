@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Listen tools",
+    "description": "Exposes transcribe and hear as native DSH tools: speech-to-text, plus non-speech sound events such as bangs, music and silence, from a local or remote listen service."
+  }
+}
