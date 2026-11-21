@@ -1,9 +1,10 @@
 /**
  * dsh-listen
  *
- * 把 listen 模块（默认 127.0.0.1:8771）注册成两个 DSH 原生工具：
- *   transcribe —— 只要文字
- *   hear       —— 文字 + 非语音声音（响动 / 静音 / 持续背景声）+ 整体氛围
+ * 把 listen 模块（默认 127.0.0.1:8771）注册成一个 DSH 原生工具 hear：
+ *   words_only:true —— 只要文字（走 /v1/transcribe）
+ *   否则           —— 文字 + 非语音声音（响动 / 静音 / 持续背景声）+ 整体氛围（走 /v1/hear）
+ * 两条路合在一个工具里：参数完全一样，拆成两个工具只是让每轮的固定开销翻倍。
  *
  * 为什么全仓库只有一个 index.js、不 import 任何兄弟项目：
  * 这个仓库要能被陌生人单独 clone 下来当 bundle 装。一旦它 require 了 ../DSH-MultiTool
@@ -339,29 +340,27 @@ function renderHear(value) {
 }
 
 /**
- * 两个工具的参数完全一样，但每次注册都返回一份**新的**对象：
- * 工具表可能会被上层加工（补默认值、加内部字段），共享同一个 schema 对象会让
- * 两个工具互相污染。
+ * 唯一的 schema 工厂：每次调用返回一份**新的**对象，避免宿主加工参数时污染共享对象。
  */
 function audioParams() {
   return {
     type: 'object',
-    additionalProperties: false,
     properties: {
       filePath: {
         type: 'string',
-        description:
-          'Absolute path to an audio or video file on the machine running the listen service. Omit when passing audioBase64.',
+        description: 'On the listen-service machine; or pass audioBase64.',
       },
       audioBase64: {
         type: 'string',
-        description:
-          'Base64 audio bytes, optionally prefixed with data:audio/...;base64,. Omit when passing filePath.',
+        description: 'Base64 audio bytes; omit when passing filePath.',
       },
       mime: {
         type: 'string',
-        description:
-          'MIME type such as audio/wav or video/mp4. Guessed from the file header or extension when omitted.',
+        description: 'e.g. audio/wav; guessed from the file when omitted.',
+      },
+      words_only: {
+        type: 'boolean',
+        description: 'true = words only via /v1/transcribe; default false.',
       },
     },
   };
@@ -379,49 +378,37 @@ export function apply(ctx, config) {
   };
 
   register({
-    name: 'transcribe',
-    description:
-      'Speech-to-text only: transcribe one audio or video file and return the words. Use it when you only need what was said, not what else is audible. Give filePath (on the machine running the listen service) or audioBase64. Returns {ok, transcript, duration, confidence}. If you also need the non-speech sounds and the overall atmosphere, call hear instead.',
-    parameters: audioParams(),
-    output: {
-      schema: { type: 'object' },
-      render: (_args, value) =>
-        textBlock(value && value.ok === false ? renderFailure('transcribe', value) : renderTranscript(value)),
-    },
-    async execute(args) {
-      const body = audioBody(args || {});
-      if (!body.filePath && !body.audioBase64) return missingSource('transcribe');
-      try {
-        return await runTranscribe(baseUrl, body);
-      } catch (err) {
-        // 兜底：连 postJson/文件读取都没想到的异常，也不能变成调用崩溃
-        return {
-          ok: false,
-          code: 'PLUGIN_ERROR',
-          message: String((err && err.message) || err),
-          hint: 'this is a bug in dsh-listen; retry once, then report it with the message above',
-        };
-      }
-    },
-  });
-
-  register({
     name: 'hear',
     description:
-      'Hear a recording the way a person would: the transcript PLUS the non-speech sound picture — sudden bangs, sustained background sound, long silences, overall loudness, and whether the clip was cut off — folded into one sentence plus an event list. Use it when what is audible matters, not only what was said (is there music? did a door slam? is it mostly quiet?). Give filePath or audioBase64. Returns {ok, duration, transcript, speechOk, confidence, events[], summary, truncated} as readable text. Use transcribe when only the words matter; hear costs more because it also profiles the energy curve.',
+      'Hear a recording: words plus non-speech sounds (bangs, music, silence) and atmosphere. words_only:true gives words only. Needs filePath or audioBase64.',
     parameters: audioParams(),
     output: {
       schema: { type: 'object' },
-      render: (_args, value) =>
-        textBlock(value && value.ok === false ? renderFailure('hear', value) : renderHear(value)),
+      render: (args, value) => {
+        // 失败时按实际走的路由报工具名；成功时优先看参数，参数没传就一直看返回形状。
+        const wordsOnly =
+          (args && args.words_only === true) ||
+          (value && value.ok !== false && !('events' in value) && !('speechOk' in value));
+        const tool = wordsOnly ? 'transcribe' : 'hear';
+        return textBlock(
+          value && value.ok === false
+            ? renderFailure(tool, value)
+            : wordsOnly
+              ? renderTranscript(value)
+              : renderHear(value),
+        );
+      },
     },
     async execute(args) {
-      const body = audioBody(args || {});
-      if (!body.filePath && !body.audioBase64) return missingSource('hear');
+      const a = args || {};
+      const wordsOnly = a.words_only === true;
+      const tool = wordsOnly ? 'transcribe' : 'hear';
+      const body = audioBody(a);
+      if (!body.filePath && !body.audioBase64) return missingSource(tool);
       try {
-        // hear 不需要本地补 base64：上游 /v1/hear 原生支持 filePath（还能直接吃视频容器），
-        // 让服务端自己抽音轨，比在这一侧把整个文件读进内存更省。
-        return await runHear(baseUrl, body);
+        // words_only 才走转写：它需要「服务端读不到 filePath 就本地补 base64」的兜底；
+        // hear 不需要，上游 /v1/hear 原生支持 filePath（还能直接吃视频容器）。
+        return wordsOnly ? await runTranscribe(baseUrl, body) : await runHear(baseUrl, body);
       } catch (err) {
         return {
           ok: false,

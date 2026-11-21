@@ -1,7 +1,7 @@
 # dsh-listen
 
 把**「听」的能力**注册成 DSH 原生工具：模型不用先 `ls` 翻目录、拼 `curl`，而是像用
-`bash` 一样直接 `transcribe` / `hear`。零运行时依赖，`index.js` 里只用 Node 内置的
+`bash` 一样直接 `hear`（`words_only:true` 只转写）。零运行时依赖，`index.js` 里只用 Node 内置的
 `fetch` 和 `fs/promises`。
 
 > Native DSH tools for a listen service — speech-to-text, plus the non-speech sound picture.
@@ -9,17 +9,17 @@
 
 ## 它做什么
 
-| 工具 | 一句话 | 后端 |
+| 模式 | 一句话 | 后端 |
 | --- | --- | --- |
-| `transcribe` | **只要文字**：把音/视频里说的话转成文本 | `POST {baseUrl}/v1/transcribe` |
-| `hear` | **还要知道还有什么声音**：台词 + 响动/静音/持续背景声 + 整体氛围 | `POST {baseUrl}/v1/hear` |
+| `hear { words_only: true }` | **只要文字**：把音/视频里说的话转成文本 | `POST {baseUrl}/v1/transcribe` |
+| `hear`（默认） | **还要知道还有什么声音**：台词 + 响动/静音/持续背景声 + 整体氛围 | `POST {baseUrl}/v1/hear` |
 
-两个工具的入参完全一样（`filePath` 或 `audioBase64`，可选 `mime`），区别只在**要不要
-非语音信息**：
+两种模式共用一个工具、一套入参（`filePath` 或 `audioBase64`，可选 `mime`），区别只在**要不要
+非语音信息** —— 拆成两个工具只会让每轮的固定 token 翻倍：
 
 | 你想知道 | 用哪个 |
 | --- | --- |
-| 这段录音说了什么 | `transcribe` |
+| 这段录音说了什么 | `hear { words_only: true }` |
 | 有没有关门声/脚步/音乐/爆炸声，是不是一直很吵，后面是不是被截断了 | `hear` |
 | 既要台词又要氛围 | `hear`（它已经包含台词，别调两次） |
 
@@ -64,10 +64,10 @@ JSON——模型看到 `hint` 才能自己恢复（换参数、提示你启动�
 `filePath` 是**listen 服务所在那台机器**上的绝对路径（不是 DSH 进程的当前目录）。
 服务在另一台机器时，`filePath` 指的是那台机器上的文件。
 
-### 关于 `transcribe` 的 `filePath`
+### 关于 `words_only:true` 的 `filePath`
 
 上游 `/v1/transcribe` 目前**只吃 base64**（不像 `/v1/hear` 能直接读 `filePath`），所以
-插件对 `transcribe` 做了一次兜底：先把 `{filePath}` 原样发给服务；**只有**服务回
+插件只在 `words_only:true` 时做一次兜底：先把 `{filePath}` 原样发给服务；**只有**服务回
 `EMPTY_AUDIO` / `BAD_BASE64` / `AUDIO_TOO_SHORT` 时，才本地把文件读成 base64 再试一次。
 服务端能读 `filePath` 的情况下不会多传一份几十 MB 的 base64，契约也不用改。
 
@@ -132,24 +132,27 @@ profile 的 `cordis.yml` 本质是一个插件条目列表。原文件如果是�
 
 ## 工具与参数 schema
 
-两个工具共用同一套参数：
+只有一个工具 `hear`，两种模式共用一套参数：
 
 ```json
 {
   "type": "object",
-  "additionalProperties": false,
   "properties": {
     "filePath": {
       "type": "string",
-      "description": "Absolute path to an audio or video file on the machine running the listen service. Omit when passing audioBase64."
+      "description": "On the listen-service machine; or pass audioBase64."
     },
     "audioBase64": {
       "type": "string",
-      "description": "Base64 audio bytes, optionally prefixed with data:audio/...;base64,. Omit when passing filePath."
+      "description": "Base64 audio bytes; omit when passing filePath."
     },
     "mime": {
       "type": "string",
-      "description": "MIME type such as audio/wav or video/mp4. Guessed from the file header or extension when omitted."
+      "description": "e.g. audio/wav; guessed from the file when omitted."
+    },
+    "words_only": {
+      "type": "boolean",
+      "description": "true = words only via /v1/transcribe; default false."
     }
   }
 }
@@ -161,14 +164,14 @@ profile 的 `cordis.yml` 本质是一个插件条目列表。原文件如果是�
 {
   "ok": false,
   "code": "MISSING_AUDIO_SOURCE",
-  "message": "transcribe needs one of filePath or audioBase64; neither was given, so nothing was sent.",
+  "message": "hear needs one of filePath or audioBase64; neither was given, so nothing was sent.",
   "hint": "pass filePath (a file on the machine running the listen service) or audioBase64 (optionally with mime)"
 }
 ```
 
 不会抛异常、也不会发一个空请求出去。
 
-### `transcribe` 返回
+### `hear { words_only: true }` 返回
 
 ```json
 { "ok": true, "transcript": "今天服务器又崩了", "duration": null, "confidence": 0.82 }
@@ -215,7 +218,7 @@ node -e "fetch('http://127.0.0.1:8771/v1/health').then(r=>r.text()).then(console
 ```
 
 有 JSON 返回说明服务活着，问题在 `baseUrl`；没返回就先把服务启动起来。
-`code: "TIMEOUT"` 表示 180s（transcribe）/ 300s（hear）内没响应，通常是 ffmpeg 卡住或
+`code: "TIMEOUT"` 表示 180s（words_only）/ 300s（hear）内没响应，通常是 ffmpeg 卡住或
 识别引擎挂了。
 
 ### 3. `{ "ok": false, "code": "FILE_NOT_FOUND" }`
@@ -225,7 +228,7 @@ node -e "fetch('http://127.0.0.1:8771/v1/health').then(r=>r.text()).then(console
 
 ### 4. `EMPTY_AUDIO` / `BAD_BASE64` / `AUDIO_TOO_SHORT`
 
-- `EMPTY_AUDIO`：服务没收到音频。`transcribe` 只给 `filePath` 时会本地读文件兜底一次；
+- `EMPTY_AUDIO`：服务没收到音频。`words_only:true` 只给 `filePath` 时会本地读文件兜底一次；
   如果仍然出现，先确认 `filePath` 可读、文件不是 0 字节。
 - `BAD_BASE64`：`audioBase64` 里混了换行/空白，或不是合法 base64。
 - `AUDIO_TOO_SHORT`：有效音频不到一帧（约 44 字节），太短的"哔"声识别不了。
@@ -243,7 +246,7 @@ node -e "fetch('http://127.0.0.1:8771/v1/health').then(r=>r.text()).then(console
 
 ### 7. `duration` 是 `null`
 
-`transcribe` 的上游不返回时长，插件不编数字——`null` 就是"不知道"。
+`words_only` 的上游不返回时长，插件不编数字——`null` 就是"不知道"。
 `hear` 有 `duration`（秒，四舍五入到整数）。
 
 ### 8. 工具注册了但模型不用
