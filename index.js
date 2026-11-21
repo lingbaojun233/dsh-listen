@@ -98,11 +98,18 @@ const textBlock = (value) => [
   { type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) },
 ];
 
+// Node 20+ 才有 AbortSignal.any；更老的运行时退化为只有本地超时。
+// 插件仍然只依赖 Node 内置能力（engines 是 >=18）。
+function withOuterSignal(local, outer) {
+  if (!outer) return local;
+  return typeof AbortSignal.any === 'function' ? AbortSignal.any([local, outer]) : local;
+}
+
 /**
  * 发一个 JSON POST。**永远不抛异常**：网络错误、超时、非 JSON 响应都变成
  * { ok:false, code, message, hint }，好让模型看到结构化失败并自己改参数。
  */
-async function postJson(url, body, timeoutMs) {
+async function postJson(url, body, timeoutMs, outerSignal) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -110,7 +117,7 @@ async function postJson(url, body, timeoutMs) {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
-      signal: controller.signal,
+      signal: withOuterSignal(controller.signal, outerSignal),
     });
     const text = await res.text();
     let data;
@@ -123,6 +130,11 @@ async function postJson(url, body, timeoutMs) {
     return { ok: true, status: res.status, data };
   } catch (err) {
     const aborted = err && err.name === 'AbortError';
+    // 宿主取消（用户打断 / 工具超时策略）不是上游挂了：
+    // 报 UNREACHABLE 会让模型去重启一个其实健康的后端。
+    if (outerSignal && outerSignal.aborted) {
+      return { ok: false, code: 'ABORTED', message: 'the caller cancelled this tool call' };
+    }
     // Node 的 fetch 网络错误只有一句 "fetch failed"，真正的原因（ECONNREFUSED 等）在 cause 里；
     // 不把它带出来，模型只会反复重试同一个错误。
     const cause = err && err.cause ? err.cause.code || err.cause.message : '';
@@ -266,21 +278,25 @@ function normalizeHear(data) {
   };
 }
 
-async function runTranscribe(baseUrl, body) {
-  const first = await postJson(`${baseUrl}/v1/transcribe`, body, TRANSCRIBE_TIMEOUT_MS);
+async function runTranscribe(baseUrl, body, outerSignal) {
+  const first = await postJson(`${baseUrl}/v1/transcribe`, body, TRANSCRIBE_TIMEOUT_MS, outerSignal);
   if (!first.ok) return first;
   if (!first.data || first.data.ok !== false) return normalizeTranscribe(first.data || {});
 
   // 上游没拿到音频、而调用方只给了 filePath：本地补 base64 再试一次。
   // 注意是「先原样透传、失败才补」，所以服务端能读 filePath 时不会多传一份 40MB 的 base64。
   if (body.filePath && !body.audioBase64 && MISSING_AUDIO_ERRORS.has(failureCode(first.data))) {
+    // 已被宿主取消时不要再发第二个请求（可能又是几十秒）
+    if (outerSignal && outerSignal.aborted) {
+      return { ok: false, code: 'ABORTED', message: 'the caller cancelled this tool call' };
+    }
     const local = await readAudioFile(body.filePath);
     if (!local.ok) {
       return { ok: false, code: local.code, message: local.message, hint: HINT_BY_CODE[local.code] };
     }
     const retryBody = { ...body, audioBase64: local.audioBase64 };
     if (!retryBody.mime && local.mime) retryBody.mime = local.mime;
-    const retry = await postJson(`${baseUrl}/v1/transcribe`, retryBody, TRANSCRIBE_TIMEOUT_MS);
+    const retry = await postJson(`${baseUrl}/v1/transcribe`, retryBody, TRANSCRIBE_TIMEOUT_MS, outerSignal);
     if (retry.ok && retry.data && retry.data.ok !== false) return normalizeTranscribe(retry.data);
     return upstreamFailure(retry.ok ? retry.data : first.data);
   }
@@ -288,8 +304,8 @@ async function runTranscribe(baseUrl, body) {
   return upstreamFailure(first.data);
 }
 
-async function runHear(baseUrl, body) {
-  const res = await postJson(`${baseUrl}/v1/hear`, body, HEAR_TIMEOUT_MS);
+async function runHear(baseUrl, body, outerSignal) {
+  const res = await postJson(`${baseUrl}/v1/hear`, body, HEAR_TIMEOUT_MS, outerSignal);
   if (!res.ok) return res;
   if (res.data && res.data.ok === false) return upstreamFailure(res.data);
   return normalizeHear(res.data || {});
@@ -399,7 +415,11 @@ export function apply(ctx, config) {
         );
       },
     },
-    async execute(args) {
+    // 工具内部按 words_only 走 180s 或 300s；宿主预算取较大者，避免提前掐断 hear。
+    timeoutMs: HEAR_TIMEOUT_MS,
+    // 只读：两次 hear 并发不会改任何本地状态。
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
       const a = args || {};
       const wordsOnly = a.words_only === true;
       const tool = wordsOnly ? 'transcribe' : 'hear';
@@ -408,7 +428,8 @@ export function apply(ctx, config) {
       try {
         // words_only 才走转写：它需要「服务端读不到 filePath 就本地补 base64」的兜底；
         // hear 不需要，上游 /v1/hear 原生支持 filePath（还能直接吃视频容器）。
-        return wordsOnly ? await runTranscribe(baseUrl, body) : await runHear(baseUrl, body);
+        const signal = exec && exec.signal;
+        return wordsOnly ? await runTranscribe(baseUrl, body, signal) : await runHear(baseUrl, body, signal);
       } catch (err) {
         return {
           ok: false,
